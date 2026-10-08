@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Everything with ONE command, run from the repo root:   qsub run_cp2k.pbs
+# Re-run the same command to resume; finished structures/stages are skipped.
+# runs/      dry ribbons: geometry optimisation (DZVP, 400 Ry) -> charges; fallback = robust SCF, restart from last geometry.
+# runs_wet/  ribbon + water (+Mg/Na): single point on the given geometry (created after the dry relaxations, see README).
+# To use many nodes at once, submit one job per structure:  bash submit_all.sh   (or: bash submit_all.sh runs_wet)
+# Finished structures (charges.dat present) are skipped, so re-submitting resumes.
+# Optional (qsub -v ...):  NAME=<one structure>  RUNS="runs"|"runs_wet"  NP=<MPI ranks>  CP2K_EXE=...  CP2K_DATA_DIR=...
+#PBS -q sc16
+#PBS -N clay_edge_cp2k
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=16:mpiprocs=16:ompthreads=1
+#PBS -j oe
+#PBS -S /bin/bash
+# some PBS setups run the script with sh/tcsh and ignore the shebang
+[ -n "${BASH_VERSION:-}" ] || exec /bin/bash "$0" "$@"
+set -o pipefail
+cd "${PBS_O_WORKDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+here="$(pwd)"
+echo "workdir=$here  bash=$BASH_VERSION"
+export OMP_NUM_THREADS=1
+
+# --- environment of the centre's own CP2K sample (module loads fix e.g. "GLIBCXX_3.4.30 not found") ---
+# Lines starting with module/source/export PATH|LD_LIBRARY_PATH... are replayed from the sample script.
+# Override the file with  qsub -v CP2K_ENV_SCRIPT=/path/to/sample.sh  (set to "none" to skip).
+envsrc="${CP2K_ENV_SCRIPT:-/home/center/app/CP2K/cp2k_20251.sh}"
+if ! type module >/dev/null 2>&1; then
+  for f in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do [[ -f "$f" ]] && . "$f" && break; done
+fi
+if [[ "$envsrc" != none && -r "$envsrc" ]]; then
+  echo "replaying environment lines from $envsrc"
+  while IFS= read -r line; do
+    echo "  $line"
+    eval "$line" || echo "  (failed: $line)" >&2
+  done < <(grep -E '^[[:space:]]*(module[[:space:]]+(load|use|add|purge|switch|swap|unload)|source[[:space:]]|\.[[:space:]]|export[[:space:]]+(PATH|LD_LIBRARY_PATH|CP2K[A-Za-z_]*|OMP_[A-Za-z_]*|I_MPI[A-Za-z_]*|OMPI[A-Za-z_]*)=)' "$envsrc" | sed 's/#.*$//')
+fi
+
+export OMP_NUM_THREADS=1   # pure-MPI run, whatever the sample set
+
+# --- locate CP2K --------------------------------------------------------
+cp2k="${CP2K_EXE:-}"
+if [[ -z "$cp2k" ]]; then
+  for c in cp2k.psmp cp2k.popt cp2k.ssmp cp2k; do command -v "$c" >/dev/null 2>&1 && { cp2k="$(command -v "$c")"; break; }; done
+fi
+if [[ -z "$cp2k" && -d /home/center/app ]]; then
+  cp2k="$(find /home/center/app -maxdepth 5 -type f -perm -u+x \( -name 'cp2k.psmp' -o -name 'cp2k.popt' \) 2>/dev/null | sort | tail -1)"
+fi
+[[ -n "$cp2k" ]] || { echo "CP2K executable not found. Set CP2K_EXE (or add the centre's 'module load cp2k' line to this script)." >&2; exit 2; }
+# --- data dir (needs BASIS_MOLOPT and GTH_POTENTIALS) ---------------------------------
+have_data() { [[ -n "${1:-}" && -f "$1/BASIS_MOLOPT" && -f "$1/GTH_POTENTIALS" ]]; }
+data=""
+have_data "${CP2K_DATA_DIR:-}" && data="$CP2K_DATA_DIR"
+if [[ -z "$data" ]]; then      # walk up from the executable: <prefix>/data, <prefix>/share/cp2k/data, ...
+  d="$(dirname "$(readlink -f "$cp2k" 2>/dev/null || echo "$cp2k")")"
+  for _ in 1 2 3 4 5; do
+    for c in "$d/data" "$d/share/cp2k/data" "$d/share/data" "$d"; do have_data "$c" && { data="$c"; break 2; }; done
+    d="$(dirname "$d")"
+  done
+fi
+if [[ -z "$data" ]]; then      # search the centre's application tree
+  for root in /home/center/app/CP2K /home/center/app; do
+    [[ -d "$root" ]] || continue
+    for f in $(find "$root" -maxdepth 7 -name BASIS_MOLOPT 2>/dev/null | head -20); do have_data "$(dirname "$f")" && { data="$(dirname "$f")"; break 2; }; done
+  done
+fi
+if [[ -z "$data" ]]; then
+  echo "BASIS_MOLOPT / GTH_POTENTIALS not found. Find them with:  find /home/center/app -name BASIS_MOLOPT" >&2
+  echo "then submit with:  qsub -v CP2K_DATA_DIR=<that directory> run_cp2k.pbs" >&2
+  exit 2
+fi
+export CP2K_DATA_DIR="$data"
+launcher="$(command -v mpirun || command -v mpiexec || true)"
+[[ -n "$launcher" ]] || { echo "mpirun/mpiexec not found (add the centre's MPI module line)." >&2; exit 2; }
+np="${NP:-${PBS_NCPUS:-$(nproc)}}"
+command -v ldd >/dev/null 2>&1 && { echo "--- ldd (missing/libstdc++) ---"; ldd "$cp2k" 2>&1 | grep -i "not found\|libstdc++"; ldd "$launcher" 2>&1 | grep -i "not found"; echo "---"; }
+echo "CP2K=$cp2k  DATA=$CP2K_DATA_DIR  MPI=$launcher -np $np"
+
+RUNS_LIST="${RUNS:-runs}"
+for RUNS in $RUNS_LIST; do
+cd "$here"
+[[ -d "$RUNS" ]] || { echo "$RUNS/ not found in $here (submit from the repo root)" >&2; continue; }
+if [[ -n "${NAME:-}" ]]; then names=("$NAME"); else names=(); for d in "$RUNS"/*/; do names+=("$(basename "$d")"); done; fi
+[[ ${#names[@]} -gt 0 ]] || { echo "no structures under $here/$RUNS" >&2; continue; }
+echo "structures ($RUNS): ${names[*]}"
+ok() { [[ -f "$1" ]] && grep -q "PROGRAM ENDED" "$1"; }
+mpi() { "$launcher" -np "$np" "$cp2k" -i "$1" -o "$2" > "${2%.out}.stdout" 2>&1; }
+last_frame() {   # $1 = trajectory xyz -> last frame on stdout
+  local n; n=$(head -n 1 "$1"); tail -n $((n + 2)) "$1"
+}
+
+for n in "${names[@]}"; do
+  cd "$here/$RUNS/$n"
+  ln -sf "$CP2K_DATA_DIR/BASIS_MOLOPT" "$CP2K_DATA_DIR/GTH_POTENTIALS" .
+  [[ -f charges.dat ]] && { echo "[$n] already done"; continue; }
+  natoms=$(head -n 1 start.xyz | tr -d ' ')
+
+  # ---- geometry: optimisation (dry ribbons) with up to 3 attempts, or the given geometry (NO_OPT) ----
+  if [[ -f NO_OPT ]]; then
+    [[ -f relaxed.xyz ]] || cp start.xyz relaxed.xyz
+  elif [[ ! -f relaxed.xyz ]]; then
+    cur=start.xyz
+    got=0
+    for k in 1 2 3; do
+      base=opt.inp; [[ $k -gt 1 ]] && base=opt_robust.inp          # attempt 1: OT; 2,3: diagonalisation + smearing
+      [[ -f "$base" ]] || { echo "[$n] missing $base (run make_cp2k.py)" >&2; break; }
+      cp "$cur" "opt_a$k.xyz"
+      sed -e "s/PROJECT opt/PROJECT opt_a$k/" -e "s/COORD_FILE_NAME start.xyz/COORD_FILE_NAME opt_a$k.xyz/" "$base" > "opt_a$k.inp"
+      echo "[$n] geometry optimisation, attempt $k ($base) from $cur"
+      mpi "opt_a$k.inp" "opt_a$k.out"
+      if ok "opt_a$k.out"; then
+        grep -q "OPTIMIZATION COMPLETED" "opt_a$k.out" || echo "[$n] WARNING: step limit reached, geometry not fully converged" >&2
+        last_frame "opt_a$k-pos-1.xyz" > relaxed.xyz; cp "opt_a$k.out" opt.out; got=1; break
+      fi
+      echo "[$n] attempt $k failed: $(grep -m1 -A1 'ABORT' "opt_a$k.out" | tr -s ' *' | tr '\n' ' ')" >&2
+      [[ -s "opt_a$k-pos-1.xyz" ]] && { last_frame "opt_a$k-pos-1.xyz" > "opt_last_a$k.xyz"; cur="opt_last_a$k.xyz"; }
+    done
+    [[ $got -eq 1 ]] || { echo "[$n] OPT FAILED after 3 attempts (see runs/$n/opt_a*.out, *.stdout)" >&2; tail -n 15 opt_a3.stdout >&2; continue; }
+  fi
+
+  # ---- charges: single point, standard SCF then robust SCF ----
+  if ! ok sp.out; then
+    for k in 1 2; do
+      base=sp.inp; [[ $k -gt 1 ]] && base=sp_robust.inp
+      [[ -f "$base" ]] || { echo "[$n] missing $base (run make_cp2k.py)" >&2; break; }
+      sed -e "s/PROJECT sp/PROJECT sp_a$k/" "$base" > "sp_a$k.inp"
+      echo "[$n] charge single point, attempt $k ($base)"
+      mpi "sp_a$k.inp" "sp_a$k.out"
+      if ok "sp_a$k.out"; then cp "sp_a$k.out" sp.out; break; fi
+      echo "[$n] SP attempt $k failed" >&2
+    done
+    ok sp.out || { echo "[$n] SP FAILED (see runs/$n/sp_a*.out, *.stdout)" >&2; tail -n 15 sp_a2.stdout >&2; continue; }
+  fi
+  # Hirshfeld net charges -> charges.dat (atom order = start.xyz); plain awk, no python needed
+  awk '/Hirshfeld Charges/ {f=1; print "# index element net_charge(Hirshfeld)"; next}
+       f && $1 ~ /^[0-9]+$/ && NF >= 6 {printf "%d %s %.5f\n", $1-1, $2, $NF; c++; next}
+       f && c > 0 && NF == 0 {exit}' sp.out > charges.tmp
+  if [[ $(grep -vc '^#' charges.tmp) -eq $natoms ]]; then mv charges.tmp charges.dat; echo "[$n] charges.dat written ($natoms atoms)"
+  else echo "[$n] could not parse Hirshfeld charges from sp.out" >&2; fi
+done
+done
+echo finished

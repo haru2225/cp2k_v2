@@ -1,0 +1,17 @@
+__pycache__/
+*.wfn
+*.wfn.bak-*
+*.restart
+*.restart.bak-*
+*.stdout
+*-pos-*.xyz
+*-1.ener
+*.cif
+*.tmp
+iterate.dat
+runs*/*/BASIS_MOLOPT
+runs*/*/GTH_POTENTIALS
+runs*/*/opt_a*
+runs*/*/opt_last*
+runs*/*/sp_a*
+results/
