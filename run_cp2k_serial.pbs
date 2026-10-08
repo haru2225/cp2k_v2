@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
-# Everything in PARALLEL with ONE command, run from the repo root:   qsub run_cp2k.pbs
-# -> a PBS job array: one sub-job per structure (indices 1-7 = runs/* in alphabetical order), all start at once.
-# Re-submit the same command to resume; finished structures (charges.dat) are skipped.
-# Serial alternative (everything in one job / a single structure): run_cp2k_serial.pbs
+# Serial: everything in one job, run from the repo root:   qsub run_cp2k_serial.pbs
 # Re-run the same command to resume; finished structures/stages are skipped.
 # runs/      dry ribbons: geometry optimisation (DZVP, 400 Ry) -> charges; fallback = robust SCF, restart from last geometry.
 # runs_wet/  ribbon + water (+Mg/Na): single point on the given geometry (created after the dry relaxations, see README).
-# To use many nodes at once, submit one job per structure:  bash submit_all.sh   (or: bash submit_all.sh runs_wet)
+# SERIAL version: all structures one after another in ONE job (or one structure: qsub -v NAME=<structure> ...).
+# The parallel version (one array sub-job per structure) is run_cp2k.pbs.
 # Finished structures (charges.dat present) are skipped, so re-submitting resumes.
 # Optional (qsub -v ...):  NAME=<one structure>  RUNS="runs"|"runs_wet"  NP=<MPI ranks>  CP2K_EXE=...  CP2K_DATA_DIR=...
 #PBS -q sc16
 #PBS -N clay_edge_cp2k
-#PBS -J 1-7
 #PBS -l walltime=24:00:00
 #PBS -l select=1:ncpus=16:mpiprocs=16:ompthreads=1
 #PBS -j oe
@@ -85,11 +82,6 @@ cd "$here"
 [[ -d "$RUNS" ]] || { echo "$RUNS/ not found in $here (submit from the repo root)" >&2; continue; }
 if [[ -n "${NAME:-}" ]]; then names=("$NAME"); else names=(); for d in "$RUNS"/*/; do names+=("$(basename "$d")"); done; fi
 [[ ${#names[@]} -gt 0 ]] || { echo "no structures under $here/$RUNS" >&2; continue; }
-AIDX="${PBS_ARRAY_INDEX:-${PBS_ARRAYID:-}}"
-if [[ -z "${NAME:-}" && -n "$AIDX" ]]; then          # array sub-job: handle only structure number AIDX
-  names=("${names[$((AIDX - 1))]:-}")
-  [[ -n "${names[0]}" ]] || { echo "array index $AIDX has no structure in $RUNS (nothing to do)" >&2; continue; }
-fi
 echo "structures ($RUNS): ${names[*]}"
 ok() { [[ -f "$1" ]] && grep -q "PROGRAM ENDED" "$1"; }
 mpi() { "$launcher" -np "$np" "$cp2k" -i "$1" -o "$2" > "${2%.out}.stdout" 2>&1; }

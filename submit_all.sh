@@ -8,5 +8,5 @@ dir="${1:-runs}"; shift || true
 for d in "$dir"/*/; do
   n=$(basename "$d")
   [[ -f "$d/charges.dat" ]] && { echo "skip $n (done)"; continue; }
-  qsub -N "c2_${n:0:12}" -v NAME="$n",RUNS="$dir" "$@" run_cp2k.pbs
+  qsub -N "c2_${n:0:12}" -v NAME="$n",RUNS="$dir" "$@" run_cp2k_serial.pbs
 done
