@@ -13,7 +13,7 @@
 #PBS -N clay_edge_cp2k
 #PBS -J 1-7
 #PBS -l walltime=24:00:00
-#PBS -l select=1:ncpus=16:mpiprocs=16:ompthreads=1
+#PBS -l select=2:ncpus=16:mpiprocs=16:ompthreads=1
 #PBS -j oe
 #PBS -S /bin/bash
 # some PBS setups run the script with sh/tcsh and ignore the shebang
@@ -75,7 +75,24 @@ fi
 export CP2K_DATA_DIR="$data"
 launcher="$(command -v mpirun || command -v mpiexec || true)"
 [[ -n "$launcher" ]] || { echo "mpirun/mpiexec not found (add the centre's MPI module line)." >&2; exit 2; }
-np="${NP:-${PBS_NCPUS:-$(nproc)}}"
+# ranks = lines of $PBS_NODEFILE (one per mpiproc, ALL nodes); PBS_NCPUS would only be the per-node chunk
+if [[ -n "${PBS_NODEFILE:-}" && -r "$PBS_NODEFILE" ]]; then
+  ranks_total=$(wc -l < "$PBS_NODEFILE" | tr -d ' '); nhosts=$(sort -u "$PBS_NODEFILE" | wc -l | tr -d ' ')
+else
+  ranks_total=${PBS_NCPUS:-$(nproc)}; nhosts=1
+fi
+np="${NP:-$ranks_total}"
+mpiopts=()
+if [[ ${nhosts:-1} -gt 1 ]]; then      # several nodes: tell the launcher where to start the ranks
+  case "$("$launcher" --version 2>&1 | head -n 3)" in
+    *"Open MPI"*|*OpenRTE*)        mpiopts=(--hostfile "$PBS_NODEFILE" --map-by core) ;;
+    *Intel*|*HYDRA*|*Hydra*|*MPICH*) mpiopts=(-f "$PBS_NODEFILE") ;;
+  esac
+fi
+if [[ -n "${MPI_OPTS:-}" ]]; then      # override, e.g.  qsub -v MPI_OPTS="--hostfile $PBS_NODEFILE" ...   ("none" = no extra options)
+  mpiopts=(); [[ "$MPI_OPTS" == none ]] || read -r -a mpiopts <<< "$MPI_OPTS"
+fi
+echo "MPI: ranks=$np nodes=${nhosts:-1} launcher_options=${mpiopts[*]:-<none>}"
 command -v ldd >/dev/null 2>&1 && { echo "--- ldd (missing/libstdc++) ---"; ldd "$cp2k" 2>&1 | grep -i "not found\|libstdc++"; ldd "$launcher" 2>&1 | grep -i "not found"; echo "---"; }
 echo "CP2K=$cp2k  DATA=$CP2K_DATA_DIR  MPI=$launcher -np $np"
 
@@ -92,7 +109,7 @@ if [[ -z "${NAME:-}" && -n "$AIDX" ]]; then          # array sub-job: handle onl
 fi
 echo "structures ($RUNS): ${names[*]}"
 ok() { [[ -f "$1" ]] && grep -q "PROGRAM ENDED" "$1"; }
-mpi() { "$launcher" -np "$np" "$cp2k" -i "$1" -o "$2" > "${2%.out}.stdout" 2>&1; }
+mpi() { "$launcher" -np "$np" "${mpiopts[@]}" "$cp2k" -i "$1" -o "$2" > "${2%.out}.stdout" 2>&1; }
 last_frame() {   # $1 = trajectory xyz -> last frame on stdout
   local n; n=$(head -n 1 "$1"); tail -n $((n + 2)) "$1"
 }

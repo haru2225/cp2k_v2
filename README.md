@@ -21,13 +21,26 @@ qsub run_cp2k.pbs
 - 途中で止まったジョブ(walltime切れなど)は、同じ `qsub` / `submit_all.sh` で最後の構造から再開する。
 - SCFが収束しない場合は自動でリトライ(最適化3回、1点計算2回): 1回目は速いOT、失敗したら直前の構造から、
   対角化 + Broyden混合 + 300 K Fermi–Dirac smearing の頑健な設定で続ける(smearingの電荷への影響は未検証)。
-- `#PBS` の既定: `-q sc16`、`select=1:ncpus=16:mpiprocs=16`、`walltime=24:00:00`(仮置き)。
+- `#PBS` の既定: `-q sc16`、`select=2:ncpus=16:mpiprocs=16`（2ノード）、`walltime=24:00:00`(仮置き)。
   変更: `qsub -l select=1:ncpus=32:mpiprocs=32 -l walltime=48:00:00 -v NP=32 run_cp2k.pbs` のようにコマンドラインで上書きできる(`NP` は使うMPI数)。
 - 環境は自動: センターのサンプル(`/home/center/app/CP2K/cp2k_20251.sh`)の `module load` / `source` / `export PATH|LD_LIBRARY_PATH...` を再生、
   CP2K実行ファイルと `BASIS_MOLOPT` / `GTH_POTENTIALS` を探す(`-v CP2K_ENV_SCRIPT=...`、`CP2K_EXE=...`、`CP2K_DATA_DIR=...` で指定可)。計算ノードにpythonは不要。
 - ログ: ジョブログの先頭に使った環境が出る。CP2Kの出力は `runs/<名前>/{opt_a*,sp_a*}.{out,stdout}`、失敗時はジョブログに末尾が出る。
 
 計算時間の見込み(未実測、v1のSZVでは最適化に約2時間、電荷計算に約15分/16コア): DZVPは1ステップあたり数倍重いが、warm startで数十ステップのはず。1構造あたり数時間〜10時間程度か。
+
+
+## 並列度(1構造あたりのノード数)
+構造(系)ごとのサブジョブに加えて、**1つのサブジョブがCP2Kを複数ノードで走らせる**。MPIランク数は `$PBS_NODEFILE` の行数(全ノード分)から自動で決まり、
+複数ノードのときはMPIの種類(Open MPI / Intel MPI・MPICH)を見て `--hostfile` か `-f` を付ける(`qsub -v MPI_OPTS="..."` で上書き、`MPI_OPTS=none` で無し)。
+```bash
+qsub run_cp2k.pbs            # 既定: 2ノード x 16 = 32ランク / サブジョブ
+bash go.sh 4                 # 4ノード x 16 = 64ランク / サブジョブ(速いが、要求が大きいぶん待ち時間が伸びる)
+bash go.sh 4 48:00:00        # walltimeも指定。以降の引数は qsub にそのまま渡す
+```
+`sc16` を16コア/ノードと仮定している。違うなら `qsub -l select=<N>:ncpus=<コア数>:mpiprocs=<コア数> run_cp2k.pbs`。
+90〜150原子のCP2Kは64ランク前後までは伸びる(それ以上は効率が落ちる)はず(未実測)。全体の資源は「サブジョブ数 x ノード数」: v2は7本、waterは12本。
+待ちが長いときは、`go.sh 2` や `-J 1-3`(一部ずつ)で小さくする。
 
 ## 次の段階: 水・イオン入りの系(リボンの最適化が終わってから)
 湿った系は、DZVPで緩和したリボンを土台に作る必要がある。
