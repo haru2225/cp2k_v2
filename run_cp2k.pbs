@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
-# Everything in PARALLEL with ONE command, run from the repo root:   qsub run_cp2k.pbs
-# -> a PBS job array: one sub-job per structure (indices 1-7 = runs/* in alphabetical order), all start at once.
-# Re-submit the same command to resume; finished structures (charges.dat) are skipped.
-# Serial alternative (everything in one job / a single structure): run_cp2k_serial.pbs
+# Everything with ONE command, one structure after another, run from the repo root:   qsub run_cp2k.pbs
+# Re-submit the same command to continue: finished structures (charges.dat) are skipped, an interrupted optimisation restarts from its last geometry.
 # Re-run the same command to resume; finished structures/stages are skipped.
 # runs/      dry ribbons: geometry optimisation (DZVP, 400 Ry) -> charges; fallback = robust SCF, restart from last geometry.
 # runs_wet/  ribbon + water (+Mg/Na): single point on the given geometry (created after the dry relaxations, see README).
-# To use many nodes at once, submit one job per structure:  bash submit_all.sh   (or: bash submit_all.sh runs_wet)
+# All structures ONE AFTER ANOTHER in a single job (each on several nodes); one structure: qsub -v NAME=<structure> run_cp2k.pbs
 # Finished structures (charges.dat present) are skipped, so re-submitting resumes.
 # Optional (qsub -v ...):  NAME=<one structure>  RUNS="runs"|"runs_wet"  NP=<MPI ranks>  CP2K_EXE=...  CP2K_DATA_DIR=...
 #PBS -q sc16
 #PBS -N clay_edge_cp2k
-#PBS -J 1-7
 #PBS -l walltime=24:00:00
 #PBS -l select=2:ncpus=16:mpiprocs=16:ompthreads=1
 #PBS -j oe
@@ -102,10 +99,13 @@ cd "$here"
 [[ -d "$RUNS" ]] || { echo "$RUNS/ not found in $here (submit from the repo root)" >&2; continue; }
 if [[ -n "${NAME:-}" ]]; then names=("$NAME"); else names=(); for d in "$RUNS"/*/; do names+=("$(basename "$d")"); done; fi
 [[ ${#names[@]} -gt 0 ]] || { echo "no structures under $here/$RUNS" >&2; continue; }
-AIDX="${PBS_ARRAY_INDEX:-${PBS_ARRAYID:-}}"
-if [[ -z "${NAME:-}" && -n "$AIDX" ]]; then          # array sub-job: handle only structure number AIDX
-  names=("${names[$((AIDX - 1))]:-}")
-  [[ -n "${names[0]}" ]] || { echo "array index $AIDX has no structure in $RUNS (nothing to do)" >&2; continue; }
+
+# one structure after another; the ones needed first (also the bases of the wet systems) go first
+prio=(bulk rib_y_o00_si rib_y_o00_al rib_x_o00_si rib_x_o00_al rib_y_o37_al rib_y_o37_si)
+if [[ -z "${NAME:-}" ]]; then
+  ordered=(); for p in "${prio[@]}"; do for x in "${names[@]}"; do [[ "$x" == "$p" ]] && ordered+=("$x"); done; done
+  for x in "${names[@]}"; do case " ${ordered[*]} " in *" $x "*) ;; *) ordered+=("$x") ;; esac; done
+  names=("${ordered[@]}")
 fi
 echo "structures ($RUNS): ${names[*]}"
 ok() { [[ -f "$1" ]] && grep -q "PROGRAM ENDED" "$1"; }
